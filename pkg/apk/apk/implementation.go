@@ -54,7 +54,6 @@ import (
 	"chainguard.dev/apko/pkg/apk/auth"
 	"chainguard.dev/apko/pkg/apk/expandapk"
 	apkfs "chainguard.dev/apko/pkg/apk/fs"
-	"chainguard.dev/apko/pkg/paths"
 
 	"github.com/chainguard-dev/clog"
 )
@@ -63,6 +62,8 @@ import (
 // We just hold the expanded APK in memory rather than re-parsing it every time,
 // which is expensive. This also dedupes simultaneous fetches.
 var globalApkCache = newFlightCache[string, *expandapk.APKExpanded]()
+
+var bySHACache = newFlightCache[string, *expandapk.APKExpanded]()
 
 type APK struct {
 	arch               string
@@ -1108,47 +1109,62 @@ func (a *APK) cachePackage(ctx context.Context, pkg InstallablePackage, exp *exp
 	_, span := otel.Tracer("go-apk").Start(ctx, "cachePackage", trace.WithAttributes(attribute.String("package", pkg.PackageName())))
 	defer span.End()
 
-	// Rename exp's temp files to content-addressable identifiers in the cache.
+	// Get SHA256 hex string for the content-addressed directory
+	sha256Hex := hex.EncodeToString(exp.APKHash)
 
-	ctlHex := hex.EncodeToString(exp.ControlHash)
-	ctlDst := filepath.Join(cacheDir, ctlHex+".ctl.tar.gz")
-
-	if err := paths.AdvertiseCachedFile(exp.ControlFile, ctlDst); err != nil {
-		return nil, err
+	// Get package directory path: <root>/pkg/<sha256>/
+	pkgDir, err := pkgDirForSHA256(a.cache.dir, sha256Hex)
+	if err != nil {
+		return nil, fmt.Errorf("getting pkg dir path: %w", err)
 	}
 
-	exp.ControlFile = ctlDst
-
-	if exp.SignatureFile != "" {
-		sigDst := filepath.Join(cacheDir, ctlHex+".sig.tar.gz")
-
-		if err := paths.AdvertiseCachedFile(exp.SignatureFile, sigDst); err != nil {
-			return nil, err
+	// moveOrSkip moves src to dst if dst doesn't exist, otherwise removes src.
+	// Since files are content-addressed, concurrent writers have identical content,
+	// so rename (which atomically overwrites) is safe. The stat check avoids
+	// unnecessary renames.
+	moveOrSkip := func(src, dst string) error {
+		if _, err := os.Stat(dst); err == nil {
+			os.Remove(src)
+			return nil
 		}
-
-		exp.SignatureFile = sigDst
+		return os.Rename(src, dst)
 	}
 
-	datHex := hex.EncodeToString(exp.PackageHash)
-	datDst := filepath.Join(cacheDir, datHex+".dat.tar.gz")
-
-	if err := paths.AdvertiseCachedFile(exp.PackageFile, datDst); err != nil {
-		return nil, err
+	// Create pkg directory if needed
+	if err := os.MkdirAll(pkgDir, 0o755); err != nil {
+		return nil, fmt.Errorf("creating pkg dir: %w", err)
 	}
-
-	exp.PackageFile = datDst
 
 	if err := exp.TarFS.Close(); err != nil {
 		return nil, fmt.Errorf("closing tarfs: %w", err)
 	}
 
-	tarDst := strings.TrimSuffix(exp.PackageFile, ".gz")
+	// Move files to cache, skipping any that already exist
+	ctlDst := filepath.Join(pkgDir, "control.tar.gz")
+	if err := moveOrSkip(exp.ControlFile, ctlDst); err != nil {
+		return nil, fmt.Errorf("moving control file: %w", err)
+	}
+	exp.ControlFile = ctlDst
 
-	if err := paths.AdvertiseCachedFile(exp.TarFile, tarDst); err != nil {
-		return nil, err
+	if exp.SignatureFile != "" {
+		sigDst := filepath.Join(pkgDir, "signature.tar.gz")
+		if err := moveOrSkip(exp.SignatureFile, sigDst); err != nil {
+			return nil, fmt.Errorf("moving signature file: %w", err)
+		}
+		exp.SignatureFile = sigDst
 	}
 
-	exp.TarFile = tarDst
+	gzDst := filepath.Join(pkgDir, "data.tar.gz")
+	if err := moveOrSkip(exp.PackageFile, gzDst); err != nil {
+		return nil, fmt.Errorf("moving data.tar.gz file: %w", err)
+	}
+	exp.PackageFile = gzDst
+
+	dataDst := filepath.Join(pkgDir, "data.tar")
+	if err := moveOrSkip(exp.TarFile, dataDst); err != nil {
+		return nil, fmt.Errorf("moving data.tar file: %w", err)
+	}
+	exp.TarFile = dataDst
 
 	// Re-initialize the tarfs with the renamed file.
 	// TODO: Split out the tarfs Index creation from the FS.
@@ -1166,13 +1182,27 @@ func (a *APK) cachePackage(ctx context.Context, pkg InstallablePackage, exp *exp
 		return nil, err
 	}
 
+	// Write mapping file: <cacheDir>/sha256 -> sha256 hex
+	// (64 bytes - partial reads just cause cache miss, not corruption)
+	mapFile := filepath.Join(cacheDir, "sha256")
+	if err := os.WriteFile(mapFile, []byte(sha256Hex), 0o644); err != nil { //nolint:gosec // this file is fine to be readable
+		return nil, fmt.Errorf("writing map file: %w", err)
+	}
+
 	return exp, nil
 }
 
-func (a *APK) cachedPackage(ctx context.Context, pkg InstallablePackage, cacheDir string) (*expandapk.APKExpanded, error) {
+func (a *APK) cachedPackage(ctx context.Context, pkg InstallablePackage, sha256Hex string) (*expandapk.APKExpanded, error) {
 	_, span := otel.Tracer("go-apk").Start(ctx, "cachedPackage", trace.WithAttributes(attribute.String("package", pkg.PackageName())))
 	defer span.End()
 
+	// Get package directory path: <root>/pkg/<sha256>/
+	pkgDir, err := pkgDirForSHA256(a.cache.dir, sha256Hex)
+	if err != nil {
+		return nil, fmt.Errorf("getting pkg dir path: %w", err)
+	}
+
+	// Get the control hash from the package checksum (from APKINDEX)
 	chk := pkg.ChecksumString()
 	if !strings.HasPrefix(chk, "Q1") {
 		return nil, fmt.Errorf("unexpected checksum: %q", chk)
@@ -1183,11 +1213,9 @@ func (a *APK) cachedPackage(ctx context.Context, pkg InstallablePackage, cacheDi
 		return nil, err
 	}
 
-	pkgHexSum := hex.EncodeToString(checksum)
-
 	exp := expandapk.APKExpanded{}
 
-	ctl := filepath.Join(cacheDir, pkgHexSum+".ctl.tar.gz")
+	ctl := filepath.Join(pkgDir, "control.tar.gz")
 	cf, err := os.Stat(ctl)
 	if err != nil {
 		return nil, err
@@ -1201,14 +1229,14 @@ func (a *APK) cachedPackage(ctx context.Context, pkg InstallablePackage, cacheDi
 		return nil, err
 	}
 
+	exp.Size += cf.Size()
+
 	exp.ControlFS, err = tarfs.New(bytes.NewReader(control), int64(len(control)))
 	if err != nil {
 		return nil, fmt.Errorf("indexing %q: %w", exp.ControlFile, err)
 	}
 
-	exp.Size += cf.Size()
-
-	sig := filepath.Join(cacheDir, pkgHexSum+".sig.tar.gz")
+	sig := filepath.Join(pkgDir, "signature.tar.gz")
 	sf, err := os.Stat(sig)
 	if err == nil {
 		exp.SignatureFile = sig
@@ -1228,7 +1256,7 @@ func (a *APK) cachedPackage(ctx context.Context, pkg InstallablePackage, cacheDi
 		return nil, fmt.Errorf("datahash for %s: %w", pkg, err)
 	}
 
-	dat := filepath.Join(cacheDir, datahash+".dat.tar.gz")
+	dat := filepath.Join(pkgDir, "data.tar.gz")
 	df, err := os.Stat(dat)
 	if err != nil {
 		return nil, err
@@ -1242,7 +1270,13 @@ func (a *APK) cachedPackage(ctx context.Context, pkg InstallablePackage, cacheDi
 		return nil, err
 	}
 
-	exp.TarFile = strings.TrimSuffix(exp.PackageFile, ".gz")
+	// Set APK hash from the directory name (it's the SHA256)
+	exp.APKHash, err = hex.DecodeString(sha256Hex)
+	if err != nil {
+		return nil, err
+	}
+
+	exp.TarFile = filepath.Join(pkgDir, "data.tar")
 	data, err := exp.PackageData()
 	if err != nil {
 		return nil, err
@@ -1284,6 +1318,10 @@ func (a *APK) expandPackage(ctx context.Context, pkg InstallablePackage) (*expan
 		// APK again.
 		if !val.IsValid() {
 			globalApkCache.Forget(pkg.URL())
+			// Also forget from bySHACache since the files are gone
+			if val.APKHash != nil {
+				bySHACache.Forget(hex.EncodeToString(val.APKHash))
+			}
 			return a.expandPackage(ctx, pkg)
 		}
 	}
@@ -1303,10 +1341,18 @@ func expandPackage(ctx context.Context, a *APK, pkg InstallablePackage) (*expand
 			return nil, err
 		}
 
-		exp, err := a.cachedPackage(ctx, pkg, cacheDir)
+		// Read the mapping file to get the SHA256
+		mapFile := filepath.Join(cacheDir, "sha256")
+		sha256Bytes, err := os.ReadFile(mapFile)
 		if err == nil {
-			log.Debugf("cache hit (%s)", pkg.PackageName())
-			return exp, nil
+			sha256Hex := string(sha256Bytes)
+			exp, err := bySHACache.Do(sha256Hex, func() (*expandapk.APKExpanded, error) {
+				return a.cachedPackage(ctx, pkg, sha256Hex)
+			})
+			if err == nil {
+				log.Debugf("cache hit (%s)", pkg.PackageName())
+				return exp, nil
+			}
 		}
 
 		log.Debugf("cache miss (%s): %v", pkg.PackageName(), err)
@@ -1332,7 +1378,10 @@ func expandPackage(ctx context.Context, a *APK, pkg InstallablePackage) (*expand
 		return exp, nil
 	}
 
-	return a.cachePackage(ctx, pkg, exp, cacheDir)
+	sha256Hex := hex.EncodeToString(exp.APKHash)
+	return bySHACache.Do(sha256Hex, func() (*expandapk.APKExpanded, error) {
+		return a.cachePackage(ctx, pkg, exp, cacheDir)
+	})
 }
 
 func packageAsURI(pkg LocatablePackage) (uri.URI, error) {

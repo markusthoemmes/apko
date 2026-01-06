@@ -731,8 +731,12 @@ func TestFetchPackage(t *testing.T) {
 		// check that the package file is in place
 		_, err = os.Stat(cacheApkDir)
 		require.NoError(t, err, "apk file not found in cache")
+		// read the sha256 from the mapping file
+		sha256Bytes, err := os.ReadFile(filepath.Join(cacheApkDir, "sha256"))
+		require.NoError(t, err, "unable to read sha256 mapping file")
+		sha256Hex := string(sha256Bytes)
 		// check that the contents are the same
-		exp, err := a.cachedPackage(ctx, pkg, cacheApkDir)
+		exp, err := a.cachedPackage(ctx, pkg, sha256Hex)
 		if err != nil {
 			t.Logf("did not find cachedPackage(%q) in %s: %v", pkg.Name, cacheApkDir, err)
 			files, err := os.ReadDir(cacheApkDir)

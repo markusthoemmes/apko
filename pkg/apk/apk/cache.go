@@ -515,3 +515,18 @@ func cachePathFromURL(root string, u url.URL) (string, error) {
 	}
 	return cacheFile, nil
 }
+
+// pkgDirForSHA256 returns the path to the package content directory.
+// Path format: <root>/pkg/<sha256-hex>/
+func pkgDirForSHA256(root string, sha256Hex string) (string, error) {
+	pkgDir := filepath.Join(root, "pkg", sha256Hex)
+
+	// Validate path is within root
+	pkgDir = filepath.Clean(pkgDir)
+	cleanRoot := filepath.Clean(root)
+	if !strings.HasPrefix(pkgDir, cleanRoot) {
+		return "", fmt.Errorf("pkg dir %s is not within root %s", pkgDir, cleanRoot)
+	}
+
+	return pkgDir, nil
+}
