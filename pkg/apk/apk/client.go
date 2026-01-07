@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package repo
+package apk
 
 import (
 	"bytes"
@@ -29,18 +29,118 @@ import (
 	"strings"
 
 	"github.com/chainguard-dev/clog"
+	"github.com/hashicorp/go-cleanhttp"
 	"go.lsp.dev/uri"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 
 	"chainguard.dev/apko/internal/tarfs"
+	"chainguard.dev/apko/pkg/apk/auth"
 	"chainguard.dev/apko/pkg/apk/expandapk"
 	"chainguard.dev/apko/pkg/paths"
 )
 
+// RepoClient defines the interface for all APK repository I/O operations.
+// Implementations handle package fetching, index retrieval, and key discovery.
+// The default implementation (DefaultRepoClient) provides HTTP-based fetching with
+// filesystem caching and in-memory request coalescing.
+type RepoClient interface {
+	// GetPackage fetches and expands an APK package. The implementation handles
+	// caching, request coalescing, and retry logic.
+	GetPackage(ctx context.Context, pkg InstallablePackage) (*expandapk.APKExpanded, error)
+}
+
+// DefaultRepoClient is the standard implementation of RepoClient that provides
+// HTTP-based fetching with filesystem caching and in-memory request coalescing.
+type DefaultRepoClient struct {
+	httpClient *http.Client
+	cacheDir   string
+	offline    bool
+	auth       auth.Authenticator
+
+	// In-memory cache for request coalescing
+	packageFlight *flightCache[string, *expandapk.APKExpanded]
+}
+
+// repoClientOpts holds the configuration for a DefaultRepoClient.
+type repoClientOpts struct {
+	cacheDir  string
+	offline   bool
+	auth      auth.Authenticator
+	transport http.RoundTripper
+}
+
+// RepoClientOption configures a DefaultRepoClient.
+type RepoClientOption func(*repoClientOpts)
+
+// WithRepoClientCacheDir sets the directory for caching downloaded packages.
+func WithRepoClientCacheDir(dir string) RepoClientOption {
+	return func(o *repoClientOpts) {
+		if dir == "" {
+			cacheDir, err := os.UserCacheDir()
+			if err != nil {
+				return
+			}
+			dir = filepath.Join(cacheDir, "dev.chainguard.go-apk")
+		} else {
+			absDir, err := filepath.Abs(dir)
+			if err != nil {
+				return
+			}
+			dir = absDir
+		}
+		o.cacheDir = dir
+	}
+}
+
+// WithRepoClientOffline configures the client to only use cached data.
+func WithRepoClientOffline(offline bool) RepoClientOption {
+	return func(o *repoClientOpts) {
+		o.offline = offline
+	}
+}
+
+// WithRepoClientAuth sets the authenticator for HTTP requests.
+func WithRepoClientAuth(a auth.Authenticator) RepoClientOption {
+	return func(o *repoClientOpts) {
+		if a != nil {
+			o.auth = a
+		}
+	}
+}
+
+// WithRepoClientTransport sets the HTTP transport for the client.
+func WithRepoClientTransport(t http.RoundTripper) RepoClientOption {
+	return func(o *repoClientOpts) {
+		if t != nil {
+			o.transport = t
+		}
+	}
+}
+
+// NewRepoClient creates a new DefaultRepoClient with the given options.
+func NewRepoClient(opts ...RepoClientOption) *DefaultRepoClient {
+	o := &repoClientOpts{
+		transport: cleanhttp.DefaultPooledTransport(),
+		auth:      auth.DefaultAuthenticators,
+	}
+
+	for _, opt := range opts {
+		opt(o)
+	}
+
+	return &DefaultRepoClient{
+		httpClient:    &http.Client{Transport: o.transport},
+		cacheDir:      o.cacheDir,
+		offline:       o.offline,
+		auth:          o.auth,
+		packageFlight: newFlightCache[string, *expandapk.APKExpanded](),
+	}
+}
+
 // GetPackage fetches and expands an APK package.
-func (c *DefaultClient) GetPackage(ctx context.Context, pkg PackageInfo) (*expandapk.APKExpanded, error) {
+func (c *DefaultRepoClient) GetPackage(ctx context.Context, pkg InstallablePackage) (*expandapk.APKExpanded, error) {
 	if c.cacheDir == "" {
 		// If we don't have a cache configured, don't use request coalescing.
 		// Calling APKExpanded.Close() will clean up a tempdir.
@@ -65,7 +165,7 @@ func (c *DefaultClient) GetPackage(ctx context.Context, pkg PackageInfo) (*expan
 	return val, err
 }
 
-func (c *DefaultClient) expandPackage(ctx context.Context, pkg PackageInfo) (*expandapk.APKExpanded, error) {
+func (c *DefaultRepoClient) expandPackage(ctx context.Context, pkg InstallablePackage) (*expandapk.APKExpanded, error) {
 	log := clog.FromContext(ctx)
 	ctx, span := otel.Tracer("go-apk").Start(ctx, "expandPackage", trace.WithAttributes(attribute.String("package", pkg.PackageName())))
 	defer span.End()
@@ -109,7 +209,7 @@ func (c *DefaultClient) expandPackage(ctx context.Context, pkg PackageInfo) (*ex
 	return c.cachePackage(ctx, pkg, exp, cacheDir)
 }
 
-func (c *DefaultClient) fetchPackage(ctx context.Context, pkg PackageInfo) (io.ReadCloser, error) {
+func (c *DefaultRepoClient) fetchPackage(ctx context.Context, pkg InstallablePackage) (io.ReadCloser, error) {
 	log := clog.FromContext(ctx)
 	log.Debugf("fetching %s", pkg.PackageName())
 
@@ -154,7 +254,7 @@ func (c *DefaultClient) fetchPackage(ctx context.Context, pkg PackageInfo) (io.R
 	}
 }
 
-func (c *DefaultClient) cachedPackage(ctx context.Context, pkg PackageInfo, cacheDir string) (*expandapk.APKExpanded, error) {
+func (c *DefaultRepoClient) cachedPackage(ctx context.Context, pkg InstallablePackage, cacheDir string) (*expandapk.APKExpanded, error) {
 	_, span := otel.Tracer("go-apk").Start(ctx, "cachedPackage", trace.WithAttributes(attribute.String("package", pkg.PackageName())))
 	defer span.End()
 
@@ -244,7 +344,7 @@ func (c *DefaultClient) cachedPackage(ctx context.Context, pkg PackageInfo, cach
 	return &exp, nil
 }
 
-func (c *DefaultClient) cachePackage(ctx context.Context, pkg PackageInfo, exp *expandapk.APKExpanded, cacheDir string) (*expandapk.APKExpanded, error) {
+func (c *DefaultRepoClient) cachePackage(ctx context.Context, pkg InstallablePackage, exp *expandapk.APKExpanded, cacheDir string) (*expandapk.APKExpanded, error) {
 	_, span := otel.Tracer("go-apk").Start(ctx, "cachePackage", trace.WithAttributes(attribute.String("package", pkg.PackageName())))
 	defer span.End()
 
@@ -306,7 +406,7 @@ func (c *DefaultClient) cachePackage(ctx context.Context, pkg PackageInfo, exp *
 	return exp, nil
 }
 
-func (c *DefaultClient) datahash(controlFS *tarfs.FS) (string, error) {
+func (c *DefaultRepoClient) datahash(controlFS *tarfs.FS) (string, error) {
 	mapping, err := controlValue(controlFS, "datahash")
 	if err != nil {
 		return "", fmt.Errorf("reading datahash from control: %w", err)
@@ -320,7 +420,7 @@ func (c *DefaultClient) datahash(controlFS *tarfs.FS) (string, error) {
 	return values[0], nil
 }
 
-func (c *DefaultClient) cacheDirForPackage(pkg PackageInfo) (string, error) {
+func (c *DefaultRepoClient) cacheDirForPackage(pkg InstallablePackage) (string, error) {
 	asURL, err := packageAsURL(pkg.URL())
 	if err != nil {
 		return "", err
@@ -353,25 +453,4 @@ func packageAsURL(u string) (*url.URL, error) {
 		return nil, err
 	}
 	return url.Parse(string(asURI))
-}
-
-func cachePathFromURL(root string, u url.URL) (string, error) {
-	u2 := u
-	u2.ForceQuery = false
-	u2.RawFragment = ""
-	u2.RawQuery = ""
-	filename := filepath.Base(u2.Path)
-	archDir := filepath.Dir(u2.Path)
-	dir := filepath.Base(archDir)
-	repoDir := filepath.Dir(archDir)
-	u2.Path = repoDir
-
-	repoDir = url.QueryEscape(u2.String())
-	cacheFile := filepath.Join(root, repoDir, dir, filename)
-	cacheFile = filepath.Clean(cacheFile)
-	cleanroot := filepath.Clean(root)
-	if !strings.HasPrefix(cacheFile, cleanroot) {
-		return "", fmt.Errorf("cache file %s is not within root %s", cacheFile, cleanroot)
-	}
-	return cacheFile, nil
 }

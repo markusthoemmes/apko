@@ -50,7 +50,6 @@ import (
 	"chainguard.dev/apko/pkg/apk/auth"
 	"chainguard.dev/apko/pkg/apk/expandapk"
 	apkfs "chainguard.dev/apko/pkg/apk/fs"
-	"chainguard.dev/apko/pkg/apk/repo"
 
 	"github.com/chainguard-dev/clog"
 )
@@ -66,7 +65,7 @@ type APK struct {
 	ignoreSignatures   bool
 	noSignatureIndexes []string
 	auth               auth.Authenticator
-	repoClient         repo.Client
+	repoClient         RepoClient
 
 	// filename to owning package, last write wins
 	installedFiles map[string]*Package
@@ -97,17 +96,17 @@ func New(ctx context.Context, options ...Option) (*APK, error) {
 	// Create a default repoClient if not provided
 	repoClient := opt.repoClient
 	if repoClient == nil {
-		repoOpts := []repo.Option{
-			repo.WithAuth(opt.auth),
-			repo.WithTransport(opt.transport),
+		repoOpts := []RepoClientOption{
+			WithRepoClientAuth(opt.auth),
+			WithRepoClientTransport(opt.transport),
 		}
 		if opt.cache != nil {
 			repoOpts = append(repoOpts,
-				repo.WithCacheDir(opt.cache.dir),
-				repo.WithOffline(opt.cache.offline),
+				WithRepoClientCacheDir(opt.cache.dir),
+				WithRepoClientOffline(opt.cache.offline),
 			)
 		}
-		repoClient = repo.NewClient(repoOpts...)
+		repoClient = NewRepoClient(repoOpts...)
 	}
 
 	return &APK{
