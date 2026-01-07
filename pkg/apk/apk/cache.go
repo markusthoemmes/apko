@@ -471,24 +471,6 @@ func (t *cacheTransport) retrieveAndSaveFile(ctx context.Context, request *http.
 	return cacheFile, nil
 }
 
-func cacheDirForPackage(root string, pkg InstallablePackage) (string, error) {
-	u, err := packageAsURL(pkg)
-	if err != nil {
-		return "", err
-	}
-
-	p, err := cachePathFromURL(root, *u)
-	if err != nil {
-		return "", err
-	}
-
-	if ext := filepath.Ext(p); ext != ".apk" {
-		return "", fmt.Errorf("unexpected ext (%s) to cache dir: %q", ext, p)
-	}
-
-	return strings.TrimSuffix(p, ".apk"), nil
-}
-
 // cachePathFromURL given a URL, figure out what the cache path would be
 func cachePathFromURL(root string, u url.URL) (string, error) {
 	// the last two levels are what we append. For example https://example.com/foo/bar/x86_64/baz.apk

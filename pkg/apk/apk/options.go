@@ -24,6 +24,7 @@ import (
 
 	"chainguard.dev/apko/pkg/apk/auth"
 	apkfs "chainguard.dev/apko/pkg/apk/fs"
+	"chainguard.dev/apko/pkg/apk/repo"
 )
 
 type opts struct {
@@ -37,6 +38,7 @@ type opts struct {
 	auth               auth.Authenticator
 	ignoreSignatures   bool
 	transport          http.RoundTripper
+	repoClient         repo.Client
 }
 
 type Option func(*opts) error
@@ -140,6 +142,16 @@ func WithTransport(t http.RoundTripper) Option {
 		if t != nil {
 			o.transport = t
 		}
+		return nil
+	}
+}
+
+// WithRepoClient sets a custom repository client for all I/O operations.
+// This allows replacing the default HTTP-based client with a custom implementation
+// for caching, testing, or other purposes.
+func WithRepoClient(c repo.Client) Option {
+	return func(o *opts) error {
+		o.repoClient = c
 		return nil
 	}
 }
