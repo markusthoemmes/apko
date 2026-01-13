@@ -97,10 +97,6 @@ type APKExpanded struct {
 	PackageHash   []byte
 	SignatureHash []byte
 
-	// APKHash is the SHA256 hash of the entire APK file (all streams combined).
-	// This is used as the content-addressed cache key.
-	APKHash []byte
-
 	ControlSize   int64
 	PackageSize   int64
 	SignatureSize int64
@@ -409,15 +405,11 @@ func ExpandApk(ctx context.Context, source io.Reader, cacheDir string) (*APKExpa
 		return nil, err
 	}
 
-	// Compute SHA256 of the entire APK stream for content-addressed caching
-	apkHasher := sha256.New()
-	hashedSource := io.TeeReader(source, apkHasher)
-
 	sw, err := newExpandApkWriter(dir, "stream", "tar.gz")
 	if err != nil {
 		return nil, fmt.Errorf("expandApk error 1: %w", err)
 	}
-	exR := newExpandApkReader(hashedSource)
+	exR := newExpandApkReader(source)
 	tr := io.TeeReader(exR, sw)
 	var gzi *gzip.Reader
 	gzipStreams := []string{}
@@ -544,8 +536,6 @@ func ExpandApk(ctx context.Context, source io.Reader, cacheDir string) (*APKExpa
 		PackageFile: gzipStreams[packageIndex],
 		PackageHash: hashes[packageIndex],
 		PackageSize: sizes[packageIndex],
-
-		APKHash: apkHasher.Sum(nil),
 	}
 	if signed {
 		expanded.SignatureFile = gzipStreams[signatureIndex]

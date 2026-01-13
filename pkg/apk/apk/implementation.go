@@ -20,6 +20,7 @@ import (
 	"context"
 	"crypto/rsa"
 	"crypto/sha1" //nolint:gosec // this is what apk tools is using
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
@@ -58,10 +59,15 @@ import (
 	"github.com/chainguard-dev/clog"
 )
 
+type apkCacheValue struct {
+	exp       *expandapk.APKExpanded
+	sha256Hex string
+}
+
 // This is terrible but simpler than plumbing around a cache for now.
 // We just hold the expanded APK in memory rather than re-parsing it every time,
 // which is expensive. This also dedupes simultaneous fetches.
-var globalApkCache = newFlightCache[string, *expandapk.APKExpanded]()
+var globalApkCache = newFlightCache[string, *apkCacheValue]()
 
 var bySHACache = newFlightCache[string, *expandapk.APKExpanded]()
 
@@ -1105,12 +1111,9 @@ func (a *APK) fetchChainguardKeys(ctx context.Context, repository string) error 
 	return nil
 }
 
-func (a *APK) cachePackage(ctx context.Context, pkg InstallablePackage, exp *expandapk.APKExpanded, cacheDir string) (*expandapk.APKExpanded, error) {
+func (a *APK) cachePackage(ctx context.Context, pkg InstallablePackage, exp *expandapk.APKExpanded, cacheDir string, sha256Hex string) (*expandapk.APKExpanded, error) {
 	_, span := otel.Tracer("go-apk").Start(ctx, "cachePackage", trace.WithAttributes(attribute.String("package", pkg.PackageName())))
 	defer span.End()
-
-	// Get SHA256 hex string for the content-addressed directory
-	sha256Hex := hex.EncodeToString(exp.APKHash)
 
 	// Get package directory path: <root>/pkg/<sha256>/
 	pkgDir, err := pkgDirForSHA256(a.cache.dir, sha256Hex)
@@ -1270,12 +1273,6 @@ func (a *APK) cachedPackage(ctx context.Context, pkg InstallablePackage, sha256H
 		return nil, err
 	}
 
-	// Set APK hash from the directory name (it's the SHA256)
-	exp.APKHash, err = hex.DecodeString(sha256Hex)
-	if err != nil {
-		return nil, err
-	}
-
 	exp.TarFile = filepath.Join(pkgDir, "data.tar")
 	data, err := exp.PackageData()
 	if err != nil {
@@ -1299,36 +1296,39 @@ func (a *APK) expandPackage(ctx context.Context, pkg InstallablePackage) (*expan
 		// Calling APKExpanded.Close() will clean up a tempdir.
 		// This is fine when we have a cache because we move all the backing files into the cache.
 		// This is not fine when we don't have a cache because the tempdir contains all our state.
-		return expandPackage(ctx, a, pkg)
+		exp, _, err := expandPackage(ctx, a, pkg)
+		return exp, err
 	}
 
 	cached := true
-	val, err := globalApkCache.Do(pkg.URL(), func() (*expandapk.APKExpanded, error) {
+	val, err := globalApkCache.Do(pkg.URL(), func() (*apkCacheValue, error) {
 		cached = false
-		return expandPackage(ctx, a, pkg)
+		exp, sha256Hex, err := expandPackage(ctx, a, pkg)
+		if err != nil {
+			return nil, err
+		}
+		return &apkCacheValue{exp: exp, sha256Hex: sha256Hex}, nil
 	})
 	if !cached {
 		// We've just executed the callback - either successfully cached or
 		// failed (errors aren't cached). Either way, no validation needed.
-		return val, err
+		return val.exp, err
 	}
 	if val != nil {
 		// If we find a value in the cache, we should check to make sure the tar file it references still exists.
 		// If it references a non-existent file, we should act as though this was a cache miss and expand the
 		// APK again.
-		if !val.IsValid() {
+		if !val.exp.IsValid() {
 			globalApkCache.Forget(pkg.URL())
 			// Also forget from bySHACache since the files are gone
-			if val.APKHash != nil {
-				bySHACache.Forget(hex.EncodeToString(val.APKHash))
-			}
+			bySHACache.Forget(val.sha256Hex)
 			return a.expandPackage(ctx, pkg)
 		}
 	}
-	return val, err
+	return val.exp, err
 }
 
-func expandPackage(ctx context.Context, a *APK, pkg InstallablePackage) (*expandapk.APKExpanded, error) {
+func expandPackage(ctx context.Context, a *APK, pkg InstallablePackage) (*expandapk.APKExpanded, string, error) {
 	log := clog.FromContext(ctx)
 	ctx, span := otel.Tracer("go-apk").Start(ctx, "expandPackage", trace.WithAttributes(attribute.String("package", pkg.PackageName())))
 	defer span.End()
@@ -1338,7 +1338,7 @@ func expandPackage(ctx context.Context, a *APK, pkg InstallablePackage) (*expand
 		var err error
 		cacheDir, err = cacheDirForPackage(a.cache.dir, pkg)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 
 		// Read the mapping file to get the SHA256
@@ -1351,37 +1351,42 @@ func expandPackage(ctx context.Context, a *APK, pkg InstallablePackage) (*expand
 			})
 			if err == nil {
 				log.Debugf("cache hit (%s)", pkg.PackageName())
-				return exp, nil
+				return exp, sha256Hex, nil
 			}
 		}
 
 		log.Debugf("cache miss (%s): %v", pkg.PackageName(), err)
 
 		if err := os.MkdirAll(cacheDir, 0o755); err != nil {
-			return nil, fmt.Errorf("unable to create cache directory %q: %w", cacheDir, err)
+			return nil, "", fmt.Errorf("unable to create cache directory %q: %w", cacheDir, err)
 		}
 	}
 
 	rc, err := a.FetchPackage(ctx, pkg)
 	if err != nil {
-		return nil, fmt.Errorf("fetching package %q: %w", pkg.PackageName(), err)
+		return nil, "", fmt.Errorf("fetching package %q: %w", pkg.PackageName(), err)
 	}
 	defer rc.Close()
 
-	exp, err := expandapk.ExpandApk(ctx, rc, cacheDir)
+	// Compute SHA256 of the entire APK stream for content-addressed caching
+	apkHasher := sha256.New()
+
+	exp, err := expandapk.ExpandApk(ctx, io.TeeReader(rc, apkHasher), cacheDir)
 	if err != nil {
-		return nil, fmt.Errorf("expanding %s: %w", pkg.PackageName(), err)
+		return nil, "", fmt.Errorf("expanding %s: %w", pkg.PackageName(), err)
 	}
+
+	sha256Hex := hex.EncodeToString(apkHasher.Sum(nil))
 
 	// If we don't have a cache, we're done.
 	if a.cache == nil {
-		return exp, nil
+		return exp, sha256Hex, nil
 	}
 
-	sha256Hex := hex.EncodeToString(exp.APKHash)
-	return bySHACache.Do(sha256Hex, func() (*expandapk.APKExpanded, error) {
-		return a.cachePackage(ctx, pkg, exp, cacheDir)
+	exp, err = bySHACache.Do(sha256Hex, func() (*expandapk.APKExpanded, error) {
+		return a.cachePackage(ctx, pkg, exp, cacheDir, sha256Hex)
 	})
+	return exp, sha256Hex, err
 }
 
 func packageAsURI(pkg LocatablePackage) (uri.URI, error) {
