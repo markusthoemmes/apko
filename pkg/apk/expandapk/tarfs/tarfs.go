@@ -40,6 +40,66 @@ func pooledBufioReader(r io.Reader) *bufio.Reader {
 	return br
 }
 
+const defaultReadAheadSize = 1 << 20 // 1MB read-ahead buffer
+
+// bufferedReaderAt wraps an io.ReaderAt with read-ahead buffering optimized
+// for sequential access patterns common when reading tar entries in order.
+type bufferedReaderAt struct {
+	ra   io.ReaderAt
+	size int64
+
+	mu       sync.Mutex
+	buf      []byte
+	bufStart int64 // start offset of valid data in buf
+	bufEnd   int64 // end offset of valid data in buf (exclusive)
+}
+
+func newBufferedReaderAt(ra io.ReaderAt, size int64) *bufferedReaderAt {
+	return &bufferedReaderAt{
+		ra:   ra,
+		size: size,
+		buf:  make([]byte, defaultReadAheadSize),
+	}
+}
+
+func (b *bufferedReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	// Reading at or past EOF
+	if off >= b.size {
+		return 0, io.EOF
+	}
+
+	// Large reads bypass the buffer entirely
+	if int64(len(p)) > int64(len(b.buf))/2 {
+		return b.ra.ReadAt(p, off)
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	// Cache hit: requested range is entirely within our buffer
+	if off >= b.bufStart && off+int64(len(p)) <= b.bufEnd {
+		copy(p, b.buf[off-b.bufStart:])
+		return len(p), nil
+	}
+
+	// Cache miss: refill buffer starting at the requested offset
+	readSize := min(int64(len(b.buf)), b.size-off)
+	n, err := b.ra.ReadAt(b.buf[:readSize], off)
+	b.bufStart = off
+	b.bufEnd = off + int64(n)
+	if n == 0 && err != nil {
+		return 0, err
+	}
+
+	// Serve from the newly filled buffer
+	copyLen := min(len(p), n)
+	copy(p, b.buf[:copyLen])
+	if copyLen < len(p) {
+		return copyLen, io.EOF
+	}
+	return copyLen, nil
+}
+
 type Entry struct {
 	Header tar.Header
 	Offset int64
@@ -95,10 +155,11 @@ func (f *File) Close() error {
 }
 
 type FS struct {
-	ra    io.ReaderAt
-	files []*Entry
-	index map[string]int
-	dirs  map[string][]fs.DirEntry
+	ra       io.ReaderAt // original reader for UnderlyingReader()
+	buffered *bufferedReaderAt
+	files    []*Entry
+	index    map[string]int
+	dirs     map[string][]fs.DirEntry
 }
 
 func (fsys *FS) Readlink(name string) (string, error) {
@@ -147,7 +208,7 @@ func (fsys *FS) open(name string, hops int) (fs.File, error) {
 		Entry: e,
 	}
 
-	f.sr = io.NewSectionReader(fsys.ra, e.Offset, e.Header.Size)
+	f.sr = io.NewSectionReader(fsys.buffered, e.Offset, e.Header.Size)
 
 	return f, nil
 }
@@ -206,10 +267,11 @@ func (cr *countReader) Read(p []byte) (int, error) {
 
 func New(ra io.ReaderAt, size int64) (*FS, error) {
 	fsys := &FS{
-		ra:    ra,
-		files: []*Entry{},
-		index: map[string]int{},
-		dirs:  map[string][]fs.DirEntry{},
+		ra:       ra,
+		buffered: newBufferedReaderAt(ra, size),
+		files:    []*Entry{},
+		index:    map[string]int{},
+		dirs:     map[string][]fs.DirEntry{},
 	}
 
 	// Number of entries in a given directory, so we know how large of a slice to allocate.
