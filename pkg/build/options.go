@@ -226,6 +226,14 @@ func WithTempDir(tmp string) Option {
 	}
 }
 
+func WithFastTempDir(dir string, budget uint64) Option {
+	return func(bc *Context) error {
+		bc.o.FastTempDir = dir
+		bc.o.FastTempBudget = budget
+		return nil
+	}
+}
+
 func WithAuthenticator(a auth.Authenticator) Option {
 	return func(bc *Context) error {
 		bc.o.Auth = a

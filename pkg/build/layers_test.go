@@ -230,6 +230,61 @@ func compareStacks(a, b []*file) error {
 	return nil
 }
 
+func TestSplitLayersFastTempDir(t *testing.T) {
+	fsys := apkfs.NewMemFS()
+	if err := fsys.MkdirAll("usr/lib/apk/db", 0755); err != nil {
+		t.Fatalf("failed to create parent directories: %v", err)
+	}
+	if err := fsys.WriteFile("usr/lib/apk/db/installed", []byte("test"), 0644); err != nil {
+		t.Fatalf("failed to create installed DB file: %v", err)
+	}
+
+	large := &apk.Package{Name: "large", Origin: "large", Version: "1.0.0", InstalledSize: 5000}
+	small := &apk.Package{Name: "small", Origin: "small", Version: "1.0.0", InstalledSize: 100}
+
+	// Groups are sorted descending by size (large first, small second).
+	groups := []*group{
+		{pkgs: []*apk.Package{large}, size: 5000, tiebreaker: "large"},
+		{pkgs: []*apk.Package{small}, size: 100, tiebreaker: "small"},
+	}
+	pkgToDiff := map[*apk.Package][]byte{
+		large: []byte("large info\n"),
+		small: []byte("small info\n"),
+	}
+
+	regularDir := t.TempDir()
+	fastDir := t.TempDir()
+
+	// Budget of 200 bytes: large (5000) won't fit, small (100) will.
+	ctx := context.Background()
+	layers, err := splitLayers(ctx, fsys, groups, pkgToDiff, regularDir, fastDir, 200)
+	if err != nil {
+		t.Fatalf("splitLayers failed: %v", err)
+	}
+
+	// 2 package layers + 1 top layer = 3
+	if len(layers) != 3 {
+		t.Fatalf("expected 3 layers, got %d", len(layers))
+	}
+
+	regularFiles, err := os.ReadDir(regularDir)
+	if err != nil {
+		t.Fatalf("reading regular dir: %v", err)
+	}
+	fastFiles, err := os.ReadDir(fastDir)
+	if err != nil {
+		t.Fatalf("reading fast dir: %v", err)
+	}
+
+	// Large layer goes to regular dir, small layer + top layer go to fast dir.
+	if len(regularFiles) != 1 {
+		t.Errorf("expected 1 file in regular dir, got %d", len(regularFiles))
+	}
+	if len(fastFiles) != 2 {
+		t.Errorf("expected 2 files in fast dir, got %d", len(fastFiles))
+	}
+}
+
 func TestSplitLayersDirectoryCreation(t *testing.T) {
 	// Create a minimal filesystem with an installed DB file
 	fsys := apkfs.NewMemFS()
@@ -280,7 +335,7 @@ func TestSplitLayersDirectoryCreation(t *testing.T) {
 
 	// Call splitLayers to create the layers
 	ctx := context.Background()
-	layers, err := splitLayers(ctx, fsys, groups, pkgToDiff, tmpDir)
+	layers, err := splitLayers(ctx, fsys, groups, pkgToDiff, tmpDir, "", 0)
 	if err != nil {
 		t.Fatalf("splitLayers failed: %v", err)
 	}

@@ -70,6 +70,12 @@ type Options struct {
 	ExtraPackages           []string              `json:"extraPackages,omitempty"`
 	Arch                    types.Architecture    `json:"arch,omitempty"`
 	TempDirPath             string                `json:"tempDirPath,omitempty"`
+	// FastTempDir is an optional fast storage directory for small layers
+	// (e.g. tmpfs, fast SSD). If empty, all layers use TempDir().
+	FastTempDir    string `json:"fastTempDir,omitempty"`
+	// FastTempBudget is the maximum total bytes of uncompressed layer data
+	// to write to FastTempDir. 0 means unlimited.
+	FastTempBudget uint64 `json:"fastTempBudget,omitempty"`
 	PackageVersionTag       string                `json:"packageVersionTag,omitempty"`
 	PackageVersionTagStem   bool                  `json:"packageVersionTagStem,omitempty"`
 	PackageVersionTagPrefix string                `json:"packageVersionTagPrefix,omitempty"`
