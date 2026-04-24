@@ -16,7 +16,6 @@ package tarfs
 
 import (
 	"archive/tar"
-	"bufio"
 	"cmp"
 	"errors"
 	"fmt"
@@ -28,16 +27,13 @@ import (
 	"time"
 )
 
-var readerPool = sync.Pool{
-	New: func() any {
-		return bufio.NewReaderSize(nil, 1<<20)
-	},
-}
+const seekableBufSize = 1 << 20
 
-func pooledBufioReader(r io.Reader) *bufio.Reader {
-	br := readerPool.Get().(*bufio.Reader)
-	br.Reset(r)
-	return br
+var bufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, seekableBufSize)
+		return &b
+	},
 }
 
 type Entry struct {
@@ -193,15 +189,93 @@ func (fsys *FS) ReadDir(name string) ([]fs.DirEntry, error) {
 	return dirs, nil
 }
 
-type countReader struct {
-	r io.Reader
-	n int64
+// seekableBuf is a buffered, seekable reader over an io.ReaderAt. Unlike
+// bufio.Reader it implements io.Seeker, which lets tar.Reader.Next() skip
+// past entry bodies and padding instead of discard-reading them. Buffering
+// is still important: some callers are backed by gcsfuse, where each raw
+// read is a GCS API call.
+type seekableBuf struct {
+	ra      io.ReaderAt
+	size    int64
+	pos     int64 // logical offset in the underlying stream
+	buf     []byte
+	bufBase int64 // underlying offset at buf[0]
+	bufLen  int   // valid bytes in buf
+	bufOff  int   // current read offset within buf
 }
 
-func (cr *countReader) Read(p []byte) (int, error) {
-	n, err := cr.r.Read(p)
-	cr.n += int64(n)
-	return n, err
+func newSeekableBuf(ra io.ReaderAt, size int64) *seekableBuf {
+	bp := bufPool.Get().(*[]byte)
+	return &seekableBuf{
+		ra:   ra,
+		size: size,
+		buf:  *bp,
+	}
+}
+
+func (s *seekableBuf) release() {
+	if s.buf == nil {
+		return
+	}
+	b := s.buf
+	s.buf = nil
+	bp := &b
+	bufPool.Put(bp)
+}
+
+func (s *seekableBuf) Read(p []byte) (int, error) {
+	if s.bufOff >= s.bufLen {
+		if s.pos >= s.size {
+			return 0, io.EOF
+		}
+		want := int64(len(s.buf))
+		if remaining := s.size - s.pos; remaining < want {
+			want = remaining
+		}
+		n, err := s.ra.ReadAt(s.buf[:want], s.pos)
+		if n == 0 {
+			if err == nil {
+				err = io.EOF
+			}
+			return 0, err
+		}
+		s.bufBase = s.pos
+		s.bufLen = n
+		s.bufOff = 0
+		// A non-nil err with n > 0 (e.g. io.EOF from ReadAt on a short
+		// final chunk) is fine; surface it on the next refill.
+	}
+	n := copy(p, s.buf[s.bufOff:s.bufLen])
+	s.bufOff += n
+	s.pos += int64(n)
+	return n, nil
+}
+
+func (s *seekableBuf) Seek(offset int64, whence int) (int64, error) {
+	var abs int64
+	switch whence {
+	case io.SeekStart:
+		abs = offset
+	case io.SeekCurrent:
+		abs = s.pos + offset
+	case io.SeekEnd:
+		abs = s.size + offset
+	default:
+		return 0, errors.New("seekableBuf: invalid whence")
+	}
+	if abs < 0 {
+		return 0, errors.New("seekableBuf: negative position")
+	}
+	// Fast path: target is still within the current buffer window.
+	if s.bufLen > 0 && abs >= s.bufBase && abs < s.bufBase+int64(s.bufLen) {
+		s.bufOff = int(abs - s.bufBase)
+	} else {
+		s.bufOff = 0
+		s.bufLen = 0
+		s.bufBase = abs
+	}
+	s.pos = abs
+	return abs, nil
 }
 
 func New(ra io.ReaderAt, size int64) (*FS, error) {
@@ -216,13 +290,10 @@ func New(ra io.ReaderAt, size int64) (*FS, error) {
 	dirCount := map[string]int{}
 
 	// TODO: Consider caching this across builds.
-	r := io.NewSectionReader(ra, 0, size)
+	sb := newSeekableBuf(ra, size)
+	defer sb.release()
 
-	br := pooledBufioReader(r)
-	defer readerPool.Put(br)
-
-	cr := &countReader{br, 0}
-	tr := tar.NewReader(cr)
+	tr := tar.NewReader(sb)
 	for {
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
@@ -231,11 +302,25 @@ func New(ra io.ReaderAt, size int64) (*FS, error) {
 		if err != nil {
 			return nil, err
 		}
+		// After Next() returns, the reader is positioned at the start
+		// of this entry's body. tar.Reader uses our Seek to skip the
+		// previous entry's body+padding instead of discard-reading it.
+		off, err := sb.Seek(0, io.SeekCurrent)
+		if err != nil {
+			return nil, err
+		}
+		// Seek-skip bypasses actually reading the body, so a header
+		// claiming a body bigger than the archive would otherwise slip
+		// through indexing and only fail on a later Open+Read. Reject
+		// it here so we mirror the old pipeline's implicit bounds check.
+		if off < 0 || hdr.Size < 0 || off > size || hdr.Size > size-off {
+			return nil, fmt.Errorf("tarfs: entry %q extends past end of archive: offset=%d size=%d archive=%d", hdr.Name, off, hdr.Size, size)
+		}
 		dir := path.Dir(hdr.Name)
 		fsys.index[hdr.Name] = len(fsys.files)
 		fsys.files = append(fsys.files, &Entry{
 			Header: *hdr,
-			Offset: cr.n,
+			Offset: off,
 			dir:    dir,
 			fi:     hdr.FileInfo(),
 		})
