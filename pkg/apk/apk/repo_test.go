@@ -695,7 +695,7 @@ func TestVersionHierarchy(t *testing.T) {
 		},
 	})
 	resolver := NewPkgResolver(context.Background(), testNamedRepositoryFromIndexes([]*RepositoryWithIndex{index}))
-	pkgWithVersions, ok := resolver.nameMap["multi-versioner"]
+	pkgWithVersions, ok := resolver.providers("multi-versioner")
 	require.True(t, ok, "found multi-versioner in nameMap")
 	for i, pkg := range pkgWithVersions {
 		require.True(t, pkg.Version == index.Packages()[i].Version, "multi-versioner has version")
@@ -1242,4 +1242,78 @@ func TestDisqualifyingOtherArchitectures(t *testing.T) {
 	resolver := NewPkgResolver(context.Background(), armIndex)
 	_, _, err := resolver.GetPackagesWithDependencies(context.Background(), names, byArch)
 	require.ErrorContains(t, err, "package \"onlyinarm64-1.0.0.apk\" not available for arch \"x86_64\"")
+}
+
+// An architecture requested with zero indexes carries no packages, so it
+// must disqualify everything rather than being silently skipped.
+func TestDisqualifyingEmptyArch(t *testing.T) {
+	_, index := testGetPackagesAndIndex()
+	indexes := testNamedRepositoryFromIndexes(index)
+
+	byArch := map[string][]NamedIndex{
+		"x86_64":  indexes,
+		"riscv64": {},
+	}
+
+	resolver := NewPkgResolver(context.Background(), indexes)
+	_, _, err := resolver.GetPackagesWithDependencies(context.Background(), []string{"package1"}, byArch)
+	require.ErrorContains(t, err, "not available for arch \"riscv64\"")
+}
+
+// A resolver holding one generation of an index must not have its candidates
+// disqualified by a byArch map holding a different generation. Cross-arch
+// disqualification was historically keyed by package pointer, so packages
+// from index objects outside byArch were never disqualified — in particular
+// never against their own architecture by a newer generation fetched
+// mid-resolution.
+func TestDisqualifyingSkewedGenerations(t *testing.T) {
+	repo := Repository{}
+	gen1 := repo.WithIndex(&APKIndex{Packages: []*Package{{Name: "skewed", Version: "1.0.0"}}})
+	gen2 := repo.WithIndex(&APKIndex{Packages: []*Package{{Name: "skewed", Version: "2.0.0"}}})
+
+	byArch := map[string][]NamedIndex{
+		"x86_64":  testNamedRepositoryFromIndexes([]*RepositoryWithIndex{gen2}),
+		"aarch64": testNamedRepositoryFromIndexes([]*RepositoryWithIndex{gen2}),
+	}
+
+	resolver := NewPkgResolver(context.Background(), testNamedRepositoryFromIndexes([]*RepositoryWithIndex{gen1}))
+	toInstall, _, err := resolver.GetPackagesWithDependencies(context.Background(), []string{"skewed"}, byArch)
+	require.NoError(t, err)
+	require.Len(t, toInstall, 1)
+	require.Equal(t, "1.0.0", toInstall[0].Version)
+}
+
+// ResolvePackage on a resolver must be safe while a
+// GetPackagesWithDependencies call is in flight on the same resolver: the
+// cross-arch predicate is scoped to the latter and must not be observable
+// (or racy) from the former. Exercised properly under -race.
+func TestConcurrentResolveDuringGetPackagesWithDependencies(t *testing.T) {
+	_, index := testGetPackagesAndIndex()
+	indexes := testNamedRepositoryFromIndexes(index)
+	byArch := map[string][]NamedIndex{
+		"x86_64":  indexes,
+		"aarch64": indexes,
+	}
+
+	resolver := NewPkgResolver(context.Background(), indexes)
+	var eg errgroup.Group
+	for range 4 {
+		eg.Go(func() error {
+			for range 20 {
+				if _, err := resolver.ResolvePackage("package1", map[*RepositoryPackage]string{}); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+	}
+	eg.Go(func() error {
+		for range 20 {
+			if _, _, err := resolver.GetPackagesWithDependencies(context.Background(), []string{"package1", "package2"}, byArch); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	require.NoError(t, eg.Wait())
 }
