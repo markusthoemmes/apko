@@ -217,22 +217,34 @@ type PkgResolver struct {
 	selected map[string]*RepositoryPackage
 }
 
-// dqed reports whether pkg is disqualified, consulting the accumulated dq map
-// first and the cross-arch availability predicate second (nil for
-// resolutions without one). Predicate hits are memoized into dq so their
-// reasons are available for error reporting.
-func dqed(dq map[*RepositoryPackage]string, unavailable func(*RepositoryPackage) string, pkg *RepositoryPackage) bool {
-	if _, ok := dq[pkg]; ok {
+// disqualified tracks the packages ruled out during one resolution: the
+// reasons accumulated as packages are excluded, plus the per-architecture
+// index data packages must be available in, checked lazily with hits
+// memoized as reasons.
+type disqualified struct {
+	reasons map[*RepositoryPackage]string
+	byArch  map[string][]*indexFragment
+}
+
+// dqed reports whether pkg is disqualified, consulting the accumulated
+// reasons first and the cross-arch availability check second. Check hits are
+// memoized so their reasons are available for error reporting.
+func (d *disqualified) dqed(pkg *RepositoryPackage) bool {
+	if _, ok := d.reasons[pkg]; ok {
 		return true
 	}
-	if unavailable == nil {
-		return false
-	}
-	if reason := unavailable(pkg); reason != "" {
-		dq[pkg] = reason
+	if reason := d.unavailable(pkg); reason != "" {
+		d.reasons[pkg] = reason
 		return true
 	}
 	return false
+}
+
+// disqualify records why pkg cannot be used.
+func (d *disqualified) disqualify(pkg *RepositoryPackage, reason string) {
+	d.reasons[pkg] = reason
+
+	// TODO: Ripple up and disqualify anything that is no longer solvable.
 }
 
 // Clone returns a copy of PkgResolver.
@@ -284,13 +296,13 @@ func (p *PkgResolver) installIfProviders(dep string) ([]*repositoryPackage, bool
 }
 
 // We select the next package based on the smallest number of candidate packages.
-func (p *PkgResolver) nextPackage(packages []string, dq map[*RepositoryPackage]string, unavailable func(*RepositoryPackage) string) (string, error) {
+func (p *PkgResolver) nextPackage(packages []string, dq *disqualified) (string, error) {
 	next := ""
 	leastDeps := 0
 
 	// first get the explicitly named packages
 	for _, pkgName := range packages {
-		pkgs, err := p.resolvePackages(pkgName, dq, unavailable)
+		pkgs, err := p.resolvePackages(pkgName, dq)
 		if err != nil {
 			return "", &ConstraintError{pkgName, err}
 		}
@@ -314,22 +326,22 @@ func (p *PkgResolver) nextPackage(packages []string, dq map[*RepositoryPackage]s
 }
 
 // Disqualify anything that provides "constraint". This is used for !foo style constraints.
-func (p *PkgResolver) disqualifyProviders(constraint string, dq map[*RepositoryPackage]string, unavailable func(*RepositoryPackage) string) {
+func (p *PkgResolver) disqualifyProviders(constraint string, dq *disqualified) {
 	parsed := cachedResolvePackageNameVersionPin(constraint)
 	providers, ok := p.providers(parsed.Name)
 	if !ok {
 		return
 	}
 
-	conflicting := filterPackages(providers, dq, unavailable, withVersion(parsed.Version, parsed.dep), withPreferPin(parsed.pin))
+	conflicting := filterPackages(providers, dq, withVersion(parsed.Version, parsed.dep), withPreferPin(parsed.pin))
 
 	for _, conflict := range conflicting {
-		if dqed(dq, unavailable, conflict.RepositoryPackage) {
+		if dq.dqed(conflict.RepositoryPackage) {
 			// Already disqualified, don't bother generating reason.
 			continue
 		}
 
-		p.disqualify(dq, conflict.RepositoryPackage, "excluded by !"+constraint)
+		dq.disqualify(conflict.RepositoryPackage, "excluded by !"+constraint)
 	}
 }
 
@@ -365,7 +377,7 @@ func (p *PkgResolver) conflictingVersion(constraint ParsedConstraint, conflict *
 }
 
 // Disqualify anything that conflicts with the given pkg.
-func (p *PkgResolver) disqualifyConflicts(pkg *RepositoryPackage, dq map[*RepositoryPackage]string, unavailable func(*RepositoryPackage) string) {
+func (p *PkgResolver) disqualifyConflicts(pkg *RepositoryPackage, dq *disqualified) {
 	for _, prov := range pkg.Provides {
 		constraint := cachedResolvePackageNameVersionPin(prov)
 		providers, ok := p.providers(constraint.Name)
@@ -378,7 +390,7 @@ func (p *PkgResolver) disqualifyConflicts(pkg *RepositoryPackage, dq map[*Reposi
 				continue
 			}
 
-			if dqed(dq, unavailable, conflict.RepositoryPackage) {
+			if dq.dqed(conflict.RepositoryPackage) {
 				// Already disqualified, don't bother generating reason.
 				continue
 			}
@@ -388,7 +400,7 @@ func (p *PkgResolver) disqualifyConflicts(pkg *RepositoryPackage, dq map[*Reposi
 				continue
 			}
 
-			p.disqualify(dq, conflict.RepositoryPackage, pkg.Filename()+" already provides "+constraint.Name)
+			dq.disqualify(conflict.RepositoryPackage, pkg.Filename()+" already provides "+constraint.Name)
 		}
 	}
 }
@@ -422,18 +434,12 @@ func (p *PkgResolver) pick(pkg *RepositoryPackage) error {
 	return nil
 }
 
-func (p *PkgResolver) disqualify(dq map[*RepositoryPackage]string, pkg *RepositoryPackage, reason string) {
-	dq[pkg] = reason
-
-	// TODO: Ripple up and disqualify anything that is no longer solvable.
-}
-
 // constrain looks through a list of constraints and disqualifies anything that would
 // conflict with any constraints that have a version selector (i.e. not versionAny).
-func (p *PkgResolver) constrain(constraints []string, dq map[*RepositoryPackage]string, unavailable func(*RepositoryPackage) string) error {
+func (p *PkgResolver) constrain(constraints []string, dq *disqualified) error {
 	for _, constraint := range constraints {
 		if strings.HasPrefix(constraint, "!") {
-			p.disqualifyProviders(constraint[1:], dq, unavailable)
+			p.disqualifyProviders(constraint[1:], dq)
 			continue
 		}
 
@@ -458,12 +464,12 @@ func (p *PkgResolver) constrain(constraints []string, dq map[*RepositoryPackage]
 				actualVersion, err := cachedParseVersion(provider.Version)
 				// skip invalid ones
 				if err != nil {
-					p.disqualify(dq, provider.RepositoryPackage, fmt.Sprintf("parsing version %q failed: %v", provider.Version, err))
+					dq.disqualify(provider.RepositoryPackage, fmt.Sprintf("parsing version %q failed: %v", provider.Version, err))
 					continue
 				}
 
 				if !parsed.dep.satisfies(actualVersion, requiredVersion) {
-					p.disqualify(dq, provider.RepositoryPackage, fmt.Sprintf("%q does not satisfy %q", provider.Version, constraint))
+					dq.disqualify(provider.RepositoryPackage, fmt.Sprintf("%q does not satisfy %q", provider.Version, constraint))
 				}
 			} else {
 				for _, provides := range provider.Provides {
@@ -479,11 +485,11 @@ func (p *PkgResolver) constrain(constraints []string, dq map[*RepositoryPackage]
 					actualVersion, err := cachedParseVersion(pp.Version)
 					// skip invalid ones
 					if err != nil {
-						dq[provider.RepositoryPackage] = fmt.Sprintf("parsing %q: %v", pp.Version, err)
+						dq.disqualify(provider.RepositoryPackage, fmt.Sprintf("parsing %q: %v", pp.Version, err))
 						continue
 					}
 					if !parsed.dep.satisfies(actualVersion, requiredVersion) {
-						dq[provider.RepositoryPackage] = fmt.Sprintf("%q provides %q which does not satisfy %q", provider.Filename(), provides, constraint)
+						dq.disqualify(provider.RepositoryPackage, fmt.Sprintf("%q provides %q which does not satisfy %q", provider.Filename(), provides, constraint))
 					}
 				}
 			}
@@ -501,9 +507,11 @@ func (p *PkgResolver) GetPackagesWithDependencies(ctx context.Context, packages 
 
 	// Tracks all the packages we have disqualified and the reason we
 	// disqualified them. Cross-arch unavailability is checked lazily per
-	// candidate and memoized here, so the predicate travels alongside dq.
-	dq := map[*RepositoryPackage]string{}
-	unavailable := archUnavailability(allArchs)
+	// candidate and memoized as a reason.
+	dq := &disqualified{
+		reasons: map[*RepositoryPackage]string{},
+		byArch:  fragmentsByArch(allArchs),
+	}
 
 	// We're going to mutate this as our set of input packages to install, so make a copy.
 	constraints := slices.Clone(packages)
@@ -513,17 +521,17 @@ func (p *PkgResolver) GetPackagesWithDependencies(ctx context.Context, packages 
 		installTracked  = map[string]*RepositoryPackage{}
 	)
 
-	if err := p.constrain(constraints, dq, unavailable); err != nil {
+	if err := p.constrain(constraints, dq); err != nil {
 		return nil, nil, fmt.Errorf("constraining initial packages: %w", err)
 	}
 
 	for len(constraints) != 0 {
-		next, err := p.nextPackage(constraints, dq, unavailable)
+		next, err := p.nextPackage(constraints, dq)
 		if err != nil {
 			return nil, nil, err
 		}
 
-		pkg, err := p.resolvePackage(next, dq, unavailable)
+		pkg, err := p.resolvePackage(next, dq)
 		if err != nil {
 			return nil, nil, &ConstraintError{next, err}
 		}
@@ -536,12 +544,12 @@ func (p *PkgResolver) GetPackagesWithDependencies(ctx context.Context, packages 
 			return s == next
 		})
 
-		p.disqualifyConflicts(pkg, dq, unavailable)
+		p.disqualifyConflicts(pkg, dq)
 	}
 
 	// now get the dependencies for each package
 	for _, pkgName := range packages {
-		pkg, deps, confs, err := p.getPackageWithDependencies(ctx, pkgName, dependenciesMap, dq, unavailable)
+		pkg, deps, confs, err := p.getPackageWithDependencies(ctx, pkgName, dependenciesMap, dq)
 		if err != nil {
 			return toInstall, nil, &ConstraintError{pkgName, err}
 		}
@@ -576,10 +584,10 @@ func (p *PkgResolver) GetPackagesWithDependencies(ctx context.Context, packages 
 // options may depend on whether or not one already is installed.
 // Must not modify the existing map directly.
 func (p *PkgResolver) GetPackageWithDependencies(ctx context.Context, pkgName string, existing map[string]*RepositoryPackage, dq map[*RepositoryPackage]string) (*RepositoryPackage, []*RepositoryPackage, []string, error) {
-	return p.getPackageWithDependencies(ctx, pkgName, existing, dq, nil)
+	return p.getPackageWithDependencies(ctx, pkgName, existing, &disqualified{reasons: dq})
 }
 
-func (p *PkgResolver) getPackageWithDependencies(ctx context.Context, pkgName string, existing map[string]*RepositoryPackage, dq map[*RepositoryPackage]string, unavailable func(*RepositoryPackage) string) (*RepositoryPackage, []*RepositoryPackage, []string, error) {
+func (p *PkgResolver) getPackageWithDependencies(ctx context.Context, pkgName string, existing map[string]*RepositoryPackage, dq *disqualified) (*RepositoryPackage, []*RepositoryPackage, []string, error) {
 	parents := make(map[string]bool)
 	localExisting := make(map[string]*RepositoryPackage, len(existing))
 	existingOrigins := map[string]string{}
@@ -590,13 +598,13 @@ func (p *PkgResolver) getPackageWithDependencies(ctx context.Context, pkgName st
 		}
 	}
 
-	pkg, err := p.resolvePackage(pkgName, dq, unavailable)
+	pkg, err := p.resolvePackage(pkgName, dq)
 	if err != nil {
 		return nil, nil, nil, &ConstraintError{pkgName, err}
 	}
 
 	pin := cachedResolvePackageNameVersionPin(pkgName).pin
-	deps, conflicts, err := p.getPackageDependencies(ctx, pkg, pin, parents, localExisting, existingOrigins, dq, unavailable)
+	deps, conflicts, err := p.getPackageDependencies(ctx, pkg, pin, parents, localExisting, existingOrigins, dq)
 	if err != nil {
 		return nil, nil, nil, &DepError{pkg, err}
 	}
@@ -654,10 +662,10 @@ func (p *PkgResolver) getPackageWithDependencies(ctx context.Context, pkgName st
 // and decreasing from there. In general, the first one in the list is the best match. This function
 // returns multiple in case you need to see all potential matches.
 func (p *PkgResolver) ResolvePackage(pkgName string, dq map[*RepositoryPackage]string) ([]*RepositoryPackage, error) {
-	return p.resolvePackages(pkgName, dq, nil)
+	return p.resolvePackages(pkgName, &disqualified{reasons: dq})
 }
 
-func (p *PkgResolver) resolvePackages(pkgName string, dq map[*RepositoryPackage]string, unavailable func(*RepositoryPackage) string) ([]*RepositoryPackage, error) {
+func (p *PkgResolver) resolvePackages(pkgName string, dq *disqualified) ([]*RepositoryPackage, error) {
 	constraint := cachedResolvePackageNameVersionPin(pkgName)
 	name, version, compare, pin := constraint.Name, constraint.Version, constraint.dep, constraint.pin
 	pkgsWithVersions, ok := p.providers(name)
@@ -667,14 +675,14 @@ func (p *PkgResolver) resolvePackages(pkgName string, dq map[*RepositoryPackage]
 
 	// pkgsWithVersions contains a map of all versions of the package
 	// get the one that most matches what was requested
-	packages := filterPackages(pkgsWithVersions, dq, unavailable, withVersion(version, compare), withPreferPin(pin))
+	packages := filterPackages(pkgsWithVersions, dq, withVersion(version, compare), withPreferPin(pin))
 	if len(packages) == 0 {
 		return nil, maybedqerror(pkgsWithVersions, dq)
 	}
 	p.sortPackages(packages, nil, name, nil, nil, pin)
 	pkgs := make([]*RepositoryPackage, 0, len(packages))
 	for _, pkg := range packages {
-		if dqed(dq, unavailable, pkg.RepositoryPackage) {
+		if dq.dqed(pkg.RepositoryPackage) {
 			continue
 		}
 		pkgs = append(pkgs, pkg.RepositoryPackage)
@@ -683,7 +691,7 @@ func (p *PkgResolver) resolvePackages(pkgName string, dq map[*RepositoryPackage]
 }
 
 // This is like ResolvePackage but we only care about the best match and not all matches.
-func (p *PkgResolver) resolvePackage(pkgName string, dq map[*RepositoryPackage]string, unavailable func(*RepositoryPackage) string) (*RepositoryPackage, error) {
+func (p *PkgResolver) resolvePackage(pkgName string, dq *disqualified) (*RepositoryPackage, error) {
 	constraint := cachedResolvePackageNameVersionPin(pkgName)
 	name, version, compare, pin := constraint.Name, constraint.Version, constraint.dep, constraint.pin
 
@@ -694,7 +702,7 @@ func (p *PkgResolver) resolvePackage(pkgName string, dq map[*RepositoryPackage]s
 
 	// pkgsWithVersions contains a map of all versions of the package
 	// get the one that most matches what was requested
-	packages := filterPackages(pkgsWithVersions, dq, unavailable, withVersion(version, compare), withPreferPin(pin))
+	packages := filterPackages(pkgsWithVersions, dq, withVersion(version, compare), withPreferPin(pin))
 	if len(packages) == 0 {
 		return nil, maybedqerror(pkgsWithVersions, dq)
 	}
@@ -729,7 +737,7 @@ func (p *PkgResolver) resolvePackage(pkgName string, dq map[*RepositoryPackage]s
 // It might change the order of install.
 // In other words, this _should_ be a DAG (acyclical), but because the packages
 // are just listing dependencies in text, it might be cyclical. We need to be careful of that.
-func (p *PkgResolver) getPackageDependencies(ctx context.Context, pkg *RepositoryPackage, allowPin string, parents map[string]bool, existing map[string]*RepositoryPackage, existingOrigins map[string]string, dq map[*RepositoryPackage]string, unavailable func(*RepositoryPackage) string) (dependencies []*RepositoryPackage, conflicts []string, err error) {
+func (p *PkgResolver) getPackageDependencies(ctx context.Context, pkg *RepositoryPackage, allowPin string, parents map[string]bool, existing map[string]*RepositoryPackage, existingOrigins map[string]string, dq *disqualified) (dependencies []*RepositoryPackage, conflicts []string, err error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, context.Cause(ctx)
 	}
@@ -747,7 +755,7 @@ func (p *PkgResolver) getPackageDependencies(ctx context.Context, pkg *Repositor
 
 	constraints := slices.Clone(pkg.Dependencies)
 
-	if err := p.constrain(constraints, dq, unavailable); err != nil {
+	if err := p.constrain(constraints, dq); err != nil {
 		return nil, nil, fmt.Errorf("constraining deps: %w", err)
 	}
 
@@ -853,7 +861,6 @@ func (p *PkgResolver) getPackageDependencies(ctx context.Context, pkg *Repositor
 			// get the one that most matches what was requested
 			pkgs := filterPackages(depPkgWithVersions,
 				dq,
-				unavailable,
 				withVersion(version, compare),
 				withAllowPin(allowPin),
 				withInstalledPackage(existing[name]),
@@ -895,7 +902,7 @@ func (p *PkgResolver) getPackageDependencies(ctx context.Context, pkg *Repositor
 		}
 
 		depPkg := best.RepositoryPackage
-		p.disqualifyConflicts(depPkg, dq, unavailable)
+		p.disqualifyConflicts(depPkg, dq)
 
 		// and then recurse to its children
 		// each child gets the parental chain, but should not affect any others,
@@ -910,7 +917,7 @@ func (p *PkgResolver) getPackageDependencies(ctx context.Context, pkg *Repositor
 			return nil, nil, err
 		}
 
-		subDeps, confs, err := p.getPackageDependencies(ctx, depPkg, allowPin, childParents, existing, existingOrigins, dq, unavailable)
+		subDeps, confs, err := p.getPackageDependencies(ctx, depPkg, allowPin, childParents, existing, existingOrigins, dq)
 		if err != nil {
 			return nil, nil, &ConstraintError{name, &DepError{depPkg, err}}
 		}
@@ -1178,10 +1185,10 @@ func (e *DisqualifiedError) Unwrap() error {
 	return e.Wrapped
 }
 
-func maybedqerror(pkgs []*repositoryPackage, dq map[*RepositoryPackage]string) error {
+func maybedqerror(pkgs []*repositoryPackage, dq *disqualified) error {
 	errs := make([]error, 0, len(pkgs))
 	for _, pkg := range pkgs {
-		reason, ok := dq[pkg.RepositoryPackage]
+		reason, ok := dq.reasons[pkg.RepositoryPackage]
 		if ok {
 			errs = append(errs, &DisqualifiedError{pkg.RepositoryPackage, errors.New(reason)})
 		}
@@ -1194,11 +1201,10 @@ func maybedqerror(pkgs []*repositoryPackage, dq map[*RepositoryPackage]string) e
 	return errors.New("not in indexes")
 }
 
-// archUnavailability returns a predicate reporting why a package cannot be
-// used across all requested architectures, or "" if it can. A package is
-// usable if some index of every architecture carries its name and version.
-// An architecture requested with zero indexes carries nothing, so it
-// disqualifies every package.
+// unavailable reports why pkg cannot be used across all architectures of
+// this resolution, or "" if it can. A package is usable if some index of
+// every architecture carries its name and version. An architecture requested
+// with zero indexes carries nothing, so it disqualifies every package.
 //
 // Only packages originating from byArch's own index objects are checked.
 // The eager implementation this replaces keyed disqualification by package
@@ -1206,9 +1212,57 @@ func maybedqerror(pkgs []*repositoryPackage, dq map[*RepositoryPackage]string) e
 // generation of the same index, fetched moments earlier) were never
 // disqualified — notably a candidate was never disqualified against its own
 // architecture by a newer generation. Preserve that.
-func archUnavailability(byArch map[string][]NamedIndex) func(*RepositoryPackage) string {
+func (d *disqualified) unavailable(pkg *RepositoryPackage) string {
+	if len(d.byArch) == 0 {
+		return ""
+	}
+
+	fromByArch := false
+	for _, frags := range d.byArch {
+		if carries(frags, pkg) {
+			fromByArch = true
+			break
+		}
+	}
+	if !fromByArch {
+		return ""
+	}
+
+	nv := nameVersion{pkg.Name, pkg.Version}
+	for arch, frags := range d.byArch {
+		if !available(frags, nv) {
+			return fmt.Sprintf("package %q not available for arch %q", pkg.Filename(), arch)
+		}
+	}
+	return ""
+}
+
+// carries reports whether pkg originates from one of frags' indexes.
+func carries(frags []*indexFragment, pkg *RepositoryPackage) bool {
+	for _, f := range frags {
+		for _, rp := range f.byName[pkg.Name] {
+			if rp.RepositoryPackage == pkg {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// available reports whether some index behind frags carries nv.
+func available(frags []*indexFragment, nv nameVersion) bool {
+	for _, f := range frags {
+		if _, ok := f.versions[nv]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// fragmentsByArch resolves byArch's indexes to their fragments, or nil for a
+// single architecture: there is no difference between archs if we have one.
+func fragmentsByArch(byArch map[string][]NamedIndex) map[string][]*indexFragment {
 	if len(byArch) <= 1 {
-		// There is no difference between archs if we have one arch.
 		return nil
 	}
 
@@ -1220,45 +1274,5 @@ func archUnavailability(byArch map[string][]NamedIndex) func(*RepositoryPackage)
 		}
 		fragments[arch] = frags
 	}
-
-	carries := func(frags []*indexFragment, pkg *RepositoryPackage) bool {
-		for _, f := range frags {
-			for _, rp := range f.byName[pkg.Name] {
-				if rp.RepositoryPackage == pkg {
-					return true
-				}
-			}
-		}
-		return false
-	}
-
-	available := func(frags []*indexFragment, nv nameVersion) bool {
-		for _, f := range frags {
-			if _, ok := f.versions[nv]; ok {
-				return true
-			}
-		}
-		return false
-	}
-
-	return func(pkg *RepositoryPackage) string {
-		fromByArch := false
-		for _, frags := range fragments {
-			if carries(frags, pkg) {
-				fromByArch = true
-				break
-			}
-		}
-		if !fromByArch {
-			return ""
-		}
-
-		nv := nameVersion{pkg.Name, pkg.Version}
-		for arch, frags := range fragments {
-			if !available(frags, nv) {
-				return fmt.Sprintf("package %q not available for arch %q", pkg.Filename(), arch)
-			}
-		}
-		return ""
-	}
+	return fragments
 }

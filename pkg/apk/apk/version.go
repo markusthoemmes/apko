@@ -461,7 +461,7 @@ func withInstalledPackage(pkg *RepositoryPackage) filterOption {
 	}
 }
 
-func filterPackages(pkgs []*repositoryPackage, dq map[*RepositoryPackage]string, unavailable func(*RepositoryPackage) string, opts ...filterOption) []*repositoryPackage {
+func filterPackages(pkgs []*repositoryPackage, dq *disqualified, opts ...filterOption) []*repositoryPackage {
 	o := &filterOptions{
 		compare: versionAny,
 	}
@@ -479,7 +479,7 @@ func filterPackages(pkgs []*repositoryPackage, dq map[*RepositoryPackage]string,
 		installedURL = o.installed.URL()
 	}
 	for _, pkg := range pkgs {
-		if dqed(dq, unavailable, pkg.RepositoryPackage) {
+		if dq.dqed(pkg.RepositoryPackage) {
 			continue
 		}
 		// do we allow this package?
